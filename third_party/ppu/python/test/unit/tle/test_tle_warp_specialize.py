@@ -150,3 +150,34 @@ def test_subslice_dot_operands_of_ring_slot(n_blk):
     torch.cuda.synchronize()
     ref = sum(a.float() @ b[k].float() for k in range(n_blk))
     torch.testing.assert_close(out, ref, atol=1e-2 * n_blk, rtol=1e-2)
+
+
+@triton.jit
+def _staged_operand_kernel(a, b, out, n_blk, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    """out = a @ sum_k b[k]: a is staged through ring slot 2 and read before the loop, which then refills that slot
+    with tiles of b. The loop-invariant read of a must not be moved into the loop past the refills."""
+    offs_m = tl.arange(0, BM)
+    offs_k = tl.arange(0, BK)
+    offs_n = tl.arange(0, BN)
+    ring = tle.gpu.alloc([3, BK, BN], dtype=tl.bfloat16, layout=_ring_layout(8, 8), scope=tle.gpu.smem)
+    a_slot = ring.slot(2).subslice(0, BK, 1)
+    tle.gpu.copy(a + offs_m[:, None] * BK + offs_k[None, :], a_slot, [BM, BK])
+    a_t = tl.load(tle.gpu.local_ptr(a_slot))
+    b_ptr = b + offs_k[:, None] * BN + offs_n[None, :]
+    acc = tl.zeros([BM, BN], dtype=tl.float32)
+    for g in range(n_blk):
+        tle.gpu.copy(b_ptr + g * BK * BN, ring.slot(g % 3), [BK, BN])
+        acc = tl.dot(a_t, tl.load(tle.gpu.local_ptr(ring.slot(g % 3))), acc)
+    tl.store(out + offs_m[:, None] * BN + offs_n[None, :], acc)
+
+
+@pytest.mark.parametrize("n_blk", [3, 7])
+def test_loop_invariant_operand_of_refilled_slot(n_blk):
+    bm, bk, bn = 64, 64, 128
+    a = torch.randn(bm, bk, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(n_blk, bk, bn, device="cuda", dtype=torch.bfloat16)
+    out = torch.empty(bm, bn, device="cuda", dtype=torch.float32)
+    _staged_operand_kernel[(1, )](a, b, out, n_blk, BM=bm, BN=bn, BK=bk, num_warps=4, num_stages=1)
+    torch.cuda.synchronize()
+    ref = sum(a.float() @ b[k].float() for k in range(n_blk))
+    torch.testing.assert_close(out, ref, atol=1e-2 * n_blk, rtol=1e-2)

@@ -27,6 +27,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -410,6 +411,23 @@ static std::optional<RematerializedValue> rematerializeLocalPointerLoad(
   if (!sourceTy || sourceTy.getShape() != targetTy.getShape() ||
       sourceTy.getElementType() != targetTy.getElementType())
     return std::nullopt;
+
+#ifdef __FLAGTREE_KEEP_SMEM_READ_ORDER__
+  // The load is re-issued at the conversion: keep it in its block, with no
+  // write in between.
+  Block *insertBlock = builder.getInsertionBlock();
+  if (!insertBlock || insertBlock != load->getBlock())
+    return std::nullopt;
+  for (Operation *op = load->getNextNode();
+       op && op != &*builder.getInsertionPoint(); op = op->getNextNode()) {
+    auto effects = getEffectsRecursively(op);
+    if (!effects || llvm::any_of(*effects, [](const auto &effect) {
+          return !isa<MemoryEffects::Read, MemoryEffects::Allocate,
+                      MemoryEffects::Free>(effect.getEffect());
+        }))
+      return std::nullopt;
+  }
+#endif
 
   Value ptr = stripConvertLayouts(load.getPtr());
   auto localPointers = ptr.getDefiningOp<tle::LocalPointersOp>();
