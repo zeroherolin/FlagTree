@@ -64,4 +64,53 @@ def TlePromoteAsyncLoadToAIUPass : Pass<"tle-promote-async-load-to-aiu", "mlir::
   let dependentDialects = ["mlir::triton::TritonDialect"];
 }
 
+def TritonPPUTleLowerPipe : Pass<"tritonppu-tle-lower-pipe", "mlir::ModuleOp"> {
+  let summary = "Lower TLE pipes to PPU hardware named barriers";
+
+  let description = [{
+    Lowers tle.pipe.* lifecycle ops to ttng named barrier ops that the PPU
+    backend maps to hardware barriers: per stage, one full barrier for each
+    reader group and one empty barrier. Pipes that do not fit the 16 hardware
+    barriers use counters in shared memory instead. cp.async copy groups are
+    drained before a stage is published. Must run after the TLE barrier
+    lowering and before the software pipeliner.
+  }];
+
+  let dependentDialects = ["mlir::arith::ArithDialect",
+                           "mlir::scf::SCFDialect",
+                           "mlir::triton::TritonDialect",
+                           "mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
+}
+
+def TritonPPUTleLowerTmaCopy : Pass<"tritonppu-tle-lower-tma-copy", "mlir::ModuleOp"> {
+  let summary = "Rewrite TLE tensor-descriptor copies for PPU";
+
+  let description = [{
+    Rewrites ttg.tma_copy (tle.gpu.copy with a tensor descriptor) to the
+    pointer form of the transfer: a descriptor load or store paired with a
+    store or load through tle.local_pointers over the whole shared buffer.
+    PPU has no TMA unit; the descriptor accesses become bounds-checked pointer
+    accesses in the descriptor-to-pointer rewrite, which must run afterwards.
+  }];
+
+  let dependentDialects = ["mlir::triton::TritonDialect",
+                           "mlir::triton::gpu::TritonGPUDialect"];
+}
+
+def TritonPPUTleZeroPadDescriptorCopies : Pass<"tritonppu-tle-zero-pad-descriptor-copies", "mlir::ModuleOp"> {
+  let summary = "Zero-fill the pointer loads of TLE descriptor copies on PPU";
+
+  let description = [{
+    After the descriptor-to-pointer rewrite, the loads created by
+    tritonppu-tle-lower-tma-copy fill out-of-bounds elements with
+    select(padding, nan, 0). cp.async can only fill with zero, so the fill
+    becomes the zero constant and a device assert checks that the descriptor
+    does not pad with NaN.
+  }];
+
+  let dependentDialects = ["mlir::arith::ArithDialect",
+                           "mlir::triton::TritonDialect"];
+}
+
 #endif
