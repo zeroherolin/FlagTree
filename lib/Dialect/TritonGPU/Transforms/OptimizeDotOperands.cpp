@@ -115,29 +115,31 @@ static Value stripMemDescViews(Value value) {
 static bool isBackedByLocalAlloc(Value value, llvm::DenseSet<Value> &active);
 
 #ifdef __TLE__
-// PPU only: true for a memdesc defined directly by a local_alloc with a
-// non-trivial swizzled shared encoding (max phase > 1, i.e. chosen explicitly
-// rather than the plain default) that is written by local_store: that layout
-// was picked for the stores, so it is kept.
-static bool keepsStoredSwizzledLayout(Value memDesc) {
-  auto alloc = memDesc.getDefiningOp<LocalAllocOp>();
-  if (!alloc || alloc.getSrc())
-    return false;
-  auto module = alloc->getParentOfType<ModuleOp>();
+// PPU only: whether a shared buffer read transposed as a dot operand keeps its
+// encoding instead of being retagged for that read. The PPU backend reads a
+// transposed operand from any swizzled layout, so a retag is only worth it for
+// a buffer nothing else shares: a local_alloc with the plain default layout
+// (max phase 1) and no views. A non-trivial swizzle (max phase > 1) was chosen
+// by the kernel for its stores or async copies and is kept. A view, a captured
+// or loop-carried value, or an allocation with views is kept too: retagging
+// would leave the other users on the old encoding for the same bytes.
+static bool keepsSharedEncodingOnPPU(Value memDesc) {
+  auto module = memDesc.getParentRegion()->getParentOfType<ModuleOp>();
   auto target =
       module ? module->getAttrOfType<StringAttr>(AttrTargetName) : nullptr;
   if (!target || !target.strref().starts_with("ppu:"))
     return false;
-  auto memDescTy = dyn_cast<MemDescType>(memDesc.getType());
-  if (!memDescTy)
-    return false;
-  auto swizzled = dyn_cast<SwizzledSharedEncodingAttr>(memDescTy.getEncoding());
-  if (!swizzled || swizzled.getMaxPhase() <= 1)
-    return false;
-  for (Operation *user : memDesc.getUsers())
-    if (isa<LocalStoreOp>(user))
+  auto alloc = memDesc.getDefiningOp<LocalAllocOp>();
+  if (!alloc)
+    return true;
+  for (Operation *user : alloc->getUsers())
+    if (user->hasTrait<OpTrait::MemDescViewTrait>())
       return true;
-  return false;
+  if (alloc.getSrc())
+    return false;
+  auto swizzled = dyn_cast<SwizzledSharedEncodingAttr>(
+      cast<MemDescType>(memDesc.getType()).getEncoding());
+  return swizzled && swizzled.getMaxPhase() > 1;
 }
 #endif
 
@@ -313,11 +315,9 @@ public:
       if (srcMemDescTy && srcMemDescTy.getShape() == srcTy.getShape() &&
           srcMemDescTy.getElementType() == srcTy.getElementType() &&
           isBackedByLocalAlloc(srcMemDesc)) {
-        // A swizzled buffer that the kernel fills with its own local_store
-        // keeps its encoding: retagging it for this read would move the cost
-        // to every store (e.g. a row-major tile becoming column-major), and
-        // the transposed view below can be read from the existing encoding.
-        if (!keepsStoredSwizzledLayout(srcMemDesc)) {
+        // A buffer that keeps its encoding is read through the transposed
+        // view below from the existing layout.
+        if (!keepsSharedEncodingOnPPU(srcMemDesc)) {
           auto updatedMemDescTy = MemDescType::get(
               srcMemDescTy.getShape(), srcMemDescTy.getElementType(),
               newInnerCvtEnc, srcMemDescTy.getMemorySpace(),

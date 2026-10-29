@@ -105,6 +105,7 @@ macro(flagtree_configure_options)
     find_package(Python3 3.10 REQUIRED COMPONENTS Development.Module Interpreter)
   elseif(FLAGTREE_BACKEND STREQUAL "ppu")
     add_definitions(-D__PPU__)
+    add_definitions(-D__FLAGTREE_KEEP_SMEM_READ_ORDER__)
   endif()
 
   set(FLAGTREE_PLUGIN "$ENV{FLAGTREE_PLUGIN}")
