@@ -21,6 +21,7 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+#include "TritonPPUGPUToLLVM/AIUUtility.h"
 #include "TritonPPUGPUTransforms/Passes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -40,6 +41,29 @@ static bool isAIULoadElementType(Type elemTy) {
     return false;
   unsigned bitWidth = elemTy.getIntOrFloatBitWidth();
   return bitWidth == 8 || bitWidth == 16 || bitWidth == 32;
+}
+
+// The copy reads a 2-D tile with one unit-stride dimension and fills
+// everything out of bounds with zeros. Rows that are a constant stride apart
+// must fit the descriptor (see AIUUtility.h).
+static bool isAIULoadLayout(triton::LoadOp loadOp) {
+  if (cast<RankedTensorType>(loadOp.getType()).getRank() != 2 ||
+      loadOp.getPadding() == triton::PaddingOption::PAD_NAN)
+    return false;
+  auto makeTensorPtr = triton::getMakeTensorPtrOp(loadOp.getPtr());
+  ArrayRef<int32_t> order = makeTensorPtr.getOrder();
+  auto strides = makeTensorPtr.getStrides();
+  auto shape = makeTensorPtr.getShape();
+  if (LLVM::PPU::getAIUConstantInt(strides[order[0]]) != 1)
+    return LLVM::PPU::getAIUConstantInt(strides[order[1]]) == 1;
+  unsigned rowDim = order[1];
+  if (LLVM::PPU::getAIURowLayout(strides, shape, rowDim) !=
+      LLVM::PPU::AIURowLayout::Strided)
+    return true;
+  return LLVM::PPU::isAIUStrideExpressible(
+      *LLVM::PPU::getAIUConstantInt(strides[rowDim]),
+      *LLVM::PPU::getAIUConstantInt(shape[order[0]]),
+      llvm::is_contained(loadOp.getBoundaryCheck(), order[0]));
 }
 
 class TlePromoteAsyncLoadToAIUPass
@@ -62,7 +86,8 @@ public:
       if (!triton::isTensorPointerType(loadOp.getPtr().getType()))
         return;
       auto resultTy = dyn_cast<RankedTensorType>(loadOp.getType());
-      if (!resultTy || !isAIULoadElementType(resultTy.getElementType()))
+      if (!resultTy || !isAIULoadElementType(resultTy.getElementType()) ||
+          !isAIULoadLayout(loadOp))
         return;
       toPromote.push_back(loadOp);
     });
@@ -71,7 +96,7 @@ public:
       builder.setInsertionPoint(loadOp);
       auto aiuLoad = triton::AIULoadOp::create(
           builder, loadOp.getLoc(), loadOp.getType(), loadOp.getPtr(),
-          loadOp.getCache(), loadOp.getEvict());
+          loadOp.getBoundaryCheck(), loadOp.getCache(), loadOp.getEvict());
       loadOp.replaceAllUsesWith(aiuLoad.getResult());
       loadOp.erase();
     }
