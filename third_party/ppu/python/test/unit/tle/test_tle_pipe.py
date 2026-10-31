@@ -79,6 +79,87 @@ def test_pipe_ring_copy(capacity, n_tiles):
     _check_lowered(ck, copies=True)
 
 
+# A producer that also consumes the pipe can finish one slot while younger
+# copies stay in flight. The remote reader still needs a completed-copy handoff.
+@triton.jit
+def _mixed_copy(writer, reader, ack, x, local_out, n, DEPTH: tl.constexpr, BLOCK: tl.constexpr, MODE: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    for t in range(tl.minimum(n, DEPTH)):
+        initial = writer.acquire(t)
+        tle.gpu.copy(x + t * BLOCK + tl.reshape(offsets, [2, BLOCK // 2]), initial.data, [2, BLOCK // 2])
+        writer.commit(t)
+    if MODE == 1:
+        tle.gpu.barrier_wait(ack[0])
+    for t in range(n):
+        if MODE != 2 or t + 1 < n:
+            current = reader.wait(t).slot
+            value = tl.reshape(tl.load(tle.gpu.local_ptr(current.data)), [BLOCK])
+            reader.release(t)
+            tl.store(local_out + t * BLOCK + offsets, value * 2)
+        if t + DEPTH < n:
+            following = writer.acquire(t + DEPTH)
+            tle.gpu.copy(x + (t + DEPTH) * BLOCK + tl.reshape(offsets, [2, BLOCK // 2]), following.data,
+                         [2, BLOCK // 2])
+            writer.commit(t + DEPTH)
+
+
+@triton.jit
+def _mixed_remote(reader, ack, y, n, BLOCK: tl.constexpr, MODE: tl.constexpr):
+    for t in range(n):
+        wait = reader.wait(t)
+        value = tl.reshape(tl.load(tle.gpu.local_ptr(wait.slot.data)), [BLOCK])
+        reader.release(t)
+        tl.store(y + t * BLOCK + tl.arange(0, BLOCK), value * 3)
+        if MODE == 1 and t == 0:
+            tle.gpu.barrier_arrive(ack[0])
+
+
+@triton.jit
+def _mixed_copy_kernel(x, local_out, remote_out, n, CAPACITY: tl.constexpr, DEPTH: tl.constexpr, BLOCK: tl.constexpr,
+                       MODE: tl.constexpr = 0):
+    layout: tl.constexpr = tle.gpu.swizzled_shared_layout(4, 1, 1, [2, 1, 0], [1, 1, 1], [1, 1, 1], [1, 1, 1],
+                                                          [2, 1, 0])
+    ring = tle.gpu.alloc([CAPACITY, 2, BLOCK // 2], dtype=tl.float32, layout=layout, scope=tle.gpu.smem)
+    pipe = tle.pipe(capacity=CAPACITY, readers=("local", "remote"), data=ring)
+    ack = tle.gpu.alloc_barriers(1, arrive_count=256)
+    tle.gpu.warp_specialize([(_mixed_copy,
+                              (pipe.writer(), pipe.reader("local"), ack, x, local_out, n, DEPTH, BLOCK, MODE)),
+                             (_mixed_remote, (pipe.reader("remote"), ack, remote_out, n, BLOCK, MODE))], [4], [128])
+
+
+@pytest.mark.parametrize("capacity,depth", [(2, 2), (3, 2), (4, 3)])
+@pytest.mark.parametrize("n_tiles", [0, 1, 2, 3, 4, 7, 33])
+def test_pipe_mixed_readers_keep_copies_in_flight(capacity, depth, n_tiles):
+    block = 512
+    x = torch.randn(max(n_tiles, 1) * block, device="cuda")
+    local_out, remote_out = torch.zeros_like(x), torch.zeros_like(x)
+    ck = _mixed_copy_kernel[(4, )](x, local_out, remote_out, n_tiles, capacity, depth, block, num_warps=4)
+    torch.cuda.synchronize()
+    if n_tiles:
+        torch.testing.assert_close(local_out, 2 * x)
+        torch.testing.assert_close(remote_out, 3 * x)
+    else:
+        assert torch.count_nonzero(local_out).item() == 0
+        assert torch.count_nonzero(remote_out).item() == 0
+    _check_lowered(ck, copies=True)
+    if n_tiles >= 2:
+        assert "num = 1 : i32, ppugpu.pipe_wait" in ck.asm["ttgir"]
+
+
+@pytest.mark.parametrize("mode", [1, 2])
+def test_pipe_mixed_readers_drain_before_peer_wait_and_exit(mode):
+    block, n_tiles = 512, 7
+    x = torch.randn(n_tiles * block, device="cuda")
+    local_out, remote_out = torch.zeros_like(x), torch.zeros_like(x)
+    _mixed_copy_kernel[(4, )](x, local_out, remote_out, n_tiles, 3, 2, block, MODE=mode, num_warps=4)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(remote_out, 3 * x)
+    local_tiles = n_tiles if mode == 1 else n_tiles - 1
+    torch.testing.assert_close(local_out[:local_tiles * block], 2 * x[:local_tiles * block])
+    if mode == 2:
+        assert torch.count_nonzero(local_out[local_tiles * block:]).item() == 0
+
+
 # ---------------------------------------------------------------- ring: register-store payload
 
 

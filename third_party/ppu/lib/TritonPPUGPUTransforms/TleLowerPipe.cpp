@@ -41,6 +41,11 @@
 // runtime stage is an scf.index_switch with one case per stage. A commit of a
 // stage written by cp.async first commits a copy group and waits for it: the
 // hardware barrier only publishes the warp's completed shared-memory stores.
+// For a single mixed pipe with a reader in the writer's group, structured
+// lowering instead queues the commits in scalar registers. Its local wait
+// completes and publishes the oldest slot while younger groups stay in flight.
+// Reusing a pending slot, blocking on another group, and leaving the writer
+// region drain pending publications. Other pipes keep the immediate wait.
 //
 // A pipe has one writer and at most one reader per warp group, and each
 // endpoint steps through the stages in order; an endpoint that runs the
@@ -582,6 +587,45 @@ static int64_t findNextVirtualBarrierId(ModuleOp module) {
   return next;
 }
 
+// A mixed pipe can complete its copies when its local reader reaches a slot,
+// leaving the younger groups in flight. Keep the queue in SSA registers, and
+// drain it before blocking on another endpoint or reusing a pending slot. Limit
+// this to one pipe and structured control flow: unrelated copy groups and
+// arbitrary region control flow need a joint copy-group analysis.
+static Region *getDeferredWriterRegion(Pipe &pipe, size_t numPipes) {
+  if (numPipes != 1 || pipe.capacity < 2 || pipe.capacity > 4 || pipe.oneShot ||
+      pipe.hasClose || !pipe.hasCpAsyncCommit || !pipe.crossGroupReaders ||
+      !llvm::any_of(pipe.readers,
+                    [](const auto &item) { return item.second.inWriterGroup; }))
+    return nullptr;
+  Region *region = nullptr;
+  for (Operation *op : pipe.ops) {
+    if (getPartition(op) != pipe.writer->partition)
+      continue;
+    if (isa<tle::PipeWriterCommitOp>(op) &&
+        !op->hasAttr(tle::kTlePipeCommitCpAsyncAttr))
+      return nullptr;
+    Region *candidate = op->getParentRegion();
+    while (isa<scf::ForOp, scf::IfOp>(candidate->getParentOp()))
+      candidate = candidate->getParentOp()->getParentRegion();
+    if (region && candidate != region)
+      return nullptr;
+    region = candidate;
+  }
+  if (!region || !region->hasOneBlock())
+    return nullptr;
+  bool supported = true;
+  region->walk([&](Operation *op) {
+    if ((op->getNumRegions() && !isa<scf::ForOp, scf::IfOp>(op)) ||
+        isa<ttg::AsyncCommitGroupOp, ttg::AsyncWaitOp, tt::CallOp,
+            tt::ElementwiseInlineAsmOp>(op) ||
+        op->getName().getStringRef().contains("aiu") ||
+        op->hasAttr("tt.load.async"))
+      supported = false;
+  });
+  return supported ? region : nullptr;
+}
+
 class PipeLowering {
 public:
   PipeLowering(Pipe &pipe) : pipe(pipe) {}
@@ -657,7 +701,231 @@ public:
     op->erase();
   }
 
+  void lowerDeferred(Region &region) {
+    OpBuilder builder(&region.front(), region.front().begin());
+    Location loc = pipe.create.getLoc();
+    Pending pending{i32Const(builder, loc, 0), i32Const(builder, loc, 0)};
+    pending = lowerDeferredBlock(region.front(), pending);
+    Operation *end = region.front().getTerminator();
+    builder.setInsertionPoint(end);
+    drainIfPending(builder, end, pending);
+  }
+
 private:
+  // Up to four stages, packed into two bits each, oldest in the low bits.
+  struct Pending {
+    Value count;
+    Value stages;
+  };
+
+  Value queueStage(OpBuilder &b, Location loc, Pending pending, int index) {
+    Value bits = pending.stages;
+    if (index)
+      bits = arith::ShRUIOp::create(b, loc, bits, i32Const(b, loc, 2 * index));
+    return arith::AndIOp::create(b, loc, bits, i32Const(b, loc, 3));
+  }
+
+  Value queueContains(OpBuilder &b, Location loc, Pending pending,
+                      Value stage) {
+    Value found = arith::ConstantIntOp::create(b, loc, 0, 1);
+    for (int i = 0; i < pipe.capacity; ++i) {
+      Value occupied =
+          arith::CmpIOp::create(b, loc, arith::CmpIPredicate::sgt,
+                                pending.count, i32Const(b, loc, i));
+      Value matches =
+          arith::CmpIOp::create(b, loc, arith::CmpIPredicate::eq,
+                                queueStage(b, loc, pending, i), stage);
+      found = arith::OrIOp::create(
+          b, loc, found, arith::AndIOp::create(b, loc, occupied, matches));
+    }
+    return found;
+  }
+
+  // Emit only constant wait counts, as required by cp.async.wait_group.
+  void waitCopies(OpBuilder &b, Location loc, Value keep) {
+    forStage(b, loc, keep, pipe.capacity, [&](OpBuilder &nested, int64_t n) {
+      auto wait = ttg::AsyncWaitOp::create(
+          nested, loc, ttg::AsyncTokenType::get(b.getContext()), ValueRange{},
+          nested.getI32IntegerAttr(n));
+      // The queue crosses structured joins through scalar registers rather
+      // than async tokens. updateWaits cannot reconstruct its distance.
+      wait->setAttr("ppugpu.pipe_wait", nested.getUnitAttr());
+    });
+  }
+
+  // Complete the oldest `count - keep` groups and publish exactly those slots.
+  Pending drain(OpBuilder &b, Operation *anchor, Pending pending, Value keep) {
+    Location loc = anchor->getLoc();
+    currentOp = anchor;
+    waitCopies(b, loc, keep);
+    Value completed = arith::SubIOp::create(b, loc, pending.count, keep);
+    auto loop =
+        scf::ForOp::create(b, loc, i32Const(b, loc, 0), completed,
+                           i32Const(b, loc, 1), ValueRange{pending.stages});
+    {
+      OpBuilder::InsertionGuard guard(b);
+      b.setInsertionPointToStart(loop.getBody());
+      Value stages = loop.getRegionIterArgs()[0];
+      Value stage = arith::AndIOp::create(b, loc, stages, i32Const(b, loc, 3));
+      publish(b, loc, stage);
+      Value rest = arith::ShRUIOp::create(b, loc, stages, i32Const(b, loc, 2));
+      scf::YieldOp::create(b, loc, ValueRange{rest});
+    }
+    return {keep, loop.getResult(0)};
+  }
+
+  template <typename Emit>
+  Pending conditionally(OpBuilder &b, Operation *anchor, Value condition,
+                        Pending pending, Emit emit) {
+    Location loc = anchor->getLoc();
+    auto branch = scf::IfOp::create(
+        b, loc, TypeRange{b.getI32Type(), b.getI32Type()}, condition, true);
+    {
+      OpBuilder::InsertionGuard guard(b);
+      b.setInsertionPointToStart(&branch.getThenRegion().front());
+      Pending next = emit(b, pending);
+      scf::YieldOp::create(b, loc, ValueRange{next.count, next.stages});
+      b.setInsertionPointToStart(&branch.getElseRegion().front());
+      scf::YieldOp::create(b, loc, ValueRange{pending.count, pending.stages});
+    }
+    return {branch.getResult(0), branch.getResult(1)};
+  }
+
+  Pending drainIfPending(OpBuilder &b, Operation *anchor, Pending pending) {
+    Value nonempty =
+        arith::CmpIOp::create(b, anchor->getLoc(), arith::CmpIPredicate::ne,
+                              pending.count, i32Const(b, anchor->getLoc(), 0));
+    return conditionally(b, anchor, nonempty, pending,
+                         [&](OpBuilder &nested, Pending p) {
+                           return drain(nested, anchor, p,
+                                        i32Const(nested, anchor->getLoc(), 0));
+                         });
+  }
+
+  Pending consume(OpBuilder &b, Operation *anchor, Pending pending,
+                  Value stage) {
+    Location loc = anchor->getLoc();
+    Value nonempty = arith::CmpIOp::create(b, loc, arith::CmpIPredicate::ne,
+                                           pending.count, i32Const(b, loc, 0));
+    Value oldest = arith::CmpIOp::create(b, loc, arith::CmpIPredicate::eq,
+                                         queueStage(b, loc, pending, 0), stage);
+    Value ready = arith::AndIOp::create(b, loc, nonempty, oldest);
+    auto branch = scf::IfOp::create(
+        b, loc, TypeRange{b.getI32Type(), b.getI32Type()}, ready, true);
+    {
+      OpBuilder::InsertionGuard guard(b);
+      b.setInsertionPointToStart(&branch.getThenRegion().front());
+      Value younger =
+          arith::SubIOp::create(b, loc, pending.count, i32Const(b, loc, 1));
+      waitCopies(b, loc, younger);
+      currentOp = anchor;
+      publish(b, loc, stage);
+      Value rest =
+          arith::ShRUIOp::create(b, loc, pending.stages, i32Const(b, loc, 2));
+      scf::YieldOp::create(b, loc, ValueRange{younger, rest});
+      b.setInsertionPointToStart(&branch.getElseRegion().front());
+      Value found = queueContains(b, loc, pending, stage);
+      Pending next = conditionally(
+          b, anchor, found, pending, [&](OpBuilder &nested, Pending p) {
+            return drain(nested, anchor, p, i32Const(nested, loc, 0));
+          });
+      scf::YieldOp::create(b, loc, ValueRange{next.count, next.stages});
+    }
+    return {branch.getResult(0), branch.getResult(1)};
+  }
+
+  Pending lowerDeferredBlock(Block &block, Pending pending) {
+    SmallVector<Operation *> original;
+    for (Operation &op : block.without_terminator())
+      original.push_back(&op);
+    for (Operation *op : original) {
+      OpBuilder b(op);
+      Location loc = op->getLoc();
+      currentOp = op;
+      if (auto loop = dyn_cast<scf::ForOp>(op)) {
+        SmallVector<Value> init(loop.getInitArgs());
+        init.append({pending.count, pending.stages});
+        auto replacement =
+            scf::ForOp::create(b, loc, loop.getLowerBound(),
+                               loop.getUpperBound(), loop.getStep(), init);
+        replacement->setAttrs(loop->getAttrs());
+        // This explicit schedule owns the writer's copy groups. Later automatic
+        // pipelining must not insert untracked groups between them.
+        replacement->setAttr("tt.num_stages", b.getI32IntegerAttr(1));
+        replacement.getBody()->erase();
+        replacement.getRegion().getBlocks().splice(
+            replacement.getRegion().getBlocks().begin(),
+            loop.getRegion().getBlocks());
+        replacement.getBody()->addArgument(b.getI32Type(), loc);
+        replacement.getBody()->addArgument(b.getI32Type(), loc);
+        auto args = replacement.getRegionIterArgs();
+        Pending next = lowerDeferredBlock(*replacement.getBody(),
+                                          {args[args.size() - 2], args.back()});
+        replacement.getBody()->getTerminator()->insertOperands(
+            loop.getNumResults(), ValueRange{next.count, next.stages});
+        loop.replaceAllUsesWith(
+            replacement.getResults().take_front(loop.getNumResults()));
+        pending = {replacement.getResults()[loop.getNumResults()],
+                   replacement.getResults().back()};
+        loop.erase();
+      } else if (auto branch = dyn_cast<scf::IfOp>(op)) {
+        SmallVector<Type> types(branch.getResultTypes());
+        types.append({b.getI32Type(), b.getI32Type()});
+        auto replacement =
+            scf::IfOp::create(b, loc, types, branch.getCondition(), true);
+        replacement->setAttrs(branch->getAttrs());
+        replacement.getThenRegion().takeBody(branch.getThenRegion());
+        if (!branch.getElseRegion().empty())
+          replacement.getElseRegion().takeBody(branch.getElseRegion());
+        else {
+          OpBuilder::InsertionGuard guard(b);
+          b.setInsertionPointToStart(&replacement.getElseRegion().front());
+          scf::YieldOp::create(b, loc);
+        }
+        for (Region *region :
+             {&replacement.getThenRegion(), &replacement.getElseRegion()}) {
+          Pending next = lowerDeferredBlock(region->front(), pending);
+          region->front().getTerminator()->insertOperands(
+              branch.getNumResults(), ValueRange{next.count, next.stages});
+        }
+        branch.replaceAllUsesWith(
+            replacement.getResults().take_front(branch.getNumResults()));
+        pending = {replacement.getResults()[branch.getNumResults()],
+                   replacement.getResults().back()};
+        branch.erase();
+      } else if (auto acquire = dyn_cast<tle::PipeWriterAcquireOp>(op)) {
+        Value reused = queueContains(b, loc, pending, acquire.getStage());
+        pending = conditionally(
+            b, op, reused, pending, [&](OpBuilder &nested, Pending p) {
+              return drain(nested, op, p, i32Const(nested, loc, 0));
+            });
+        lower(op);
+      } else if (auto commit = dyn_cast<tle::PipeWriterCommitOp>(op)) {
+        ttg::AsyncCommitGroupOp::create(
+            b, loc, ttg::AsyncTokenType::get(b.getContext()), ValueRange{});
+        Value shift =
+            arith::MulIOp::create(b, loc, pending.count, i32Const(b, loc, 2));
+        Value stageBits =
+            arith::ShLIOp::create(b, loc, commit.getStage(), shift);
+        pending = {
+            arith::AddIOp::create(b, loc, pending.count, i32Const(b, loc, 1)),
+            arith::OrIOp::create(b, loc, pending.stages, stageBits)};
+        op->erase();
+      } else if (auto wait = dyn_cast<tle::PipeReaderWaitOp>(op)) {
+        pending = consume(b, op, pending, wait.getStage());
+        lower(op);
+      } else if (isa<tle::PipeReaderReleaseOp>(op)) {
+        lower(op);
+      } else if (isa<ttng::NamedBarrierWaitOp, tt::AtomicRMWOp,
+                     tt::AtomicCASOp>(op) ||
+                 (isa<tt::LoadOp>(op) &&
+                  cast<tt::LoadOp>(op).getIsVolatile())) {
+        pending = drainIfPending(b, op, pending);
+      }
+    }
+    return pending;
+  }
+
   const Endpoint &readerOf(Operation *op) {
     std::string name;
     if (auto attr = op->getAttrOfType<StringAttr>("reader_name"))
@@ -901,8 +1169,18 @@ public:
     for (auto &[key, pipe] : pipes) {
       PipeLowering lowering(pipe);
       lowering.lowerCreate();
-      for (Operation *op : pipe.ops)
-        lowering.lower(op);
+      if (Region *writer = getDeferredWriterRegion(pipe, pipes.size())) {
+        SmallVector<Operation *> remote;
+        for (Operation *op : pipe.ops)
+          if (!writer->isAncestor(op->getParentRegion()))
+            remote.push_back(op);
+        lowering.lowerDeferred(*writer);
+        for (Operation *op : remote)
+          lowering.lower(op);
+      } else {
+        for (Operation *op : pipe.ops)
+          lowering.lower(op);
+      }
       pipe.create.erase();
     }
 #endif
