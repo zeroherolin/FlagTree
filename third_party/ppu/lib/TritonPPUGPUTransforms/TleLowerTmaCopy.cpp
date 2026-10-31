@@ -21,46 +21,21 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-// Rewrite of TLE tensor-descriptor copies (ttg.tma_copy) for PPU.
+// PPU has no TMA unit. Lower descriptor copies to descriptor loads/stores
+// paired with accesses through tle.local_pointers. The generic descriptor-to-
+// pointer pass then expands them to bounds-checked accesses; global-to-shared
+// copies become cp.async in the local-pointer store optimization. Copies that
+// signal an mbarrier remain unsupported.
 //
-// PPU has no TMA unit. A descriptor copy between global memory and a shared
-// buffer becomes the pointer form of the same transfer at the TTIR level:
-//
-//   global -> shared: tt.descriptor_load desc[indices], stored through
-//                     tle.local_pointers over the whole buffer;
-//   shared -> global: tt.load through tle.local_pointers over the whole
-//                     buffer, tt.descriptor_store desc[indices].
-//
-// The descriptor ops are then rewritten to bounds-checked pointer accesses by
-// the generic descriptor-to-pointer pass, and a global-to-shared pair becomes
-// a cp.async copy in the TLE local-pointer store optimization, including the
-// pipe commit bookkeeping of a stage filled this way. Unit leading dimensions
-// of the descriptor block that the buffer does not have are dropped with a
-// reshape. Copies with a completion barrier (mbarrier) stay rejected by the
-// backend.
-//
-// The second pass of this file runs after the descriptor-to-pointer rewrite
-// and finishes the loads created here so that they become cp.async copies:
-//
-// - Padding: cp.async fills the out-of-bounds elements of a masked copy with
-//   zero, while a descriptor may ask for NaN padding; for a host descriptor
-//   the choice is a kernel argument, so the rewrite gives the load
-//   `other = select(padding, nan, 0)`. The fill becomes the zero constant and
-//   a device assert checks that the descriptor does not pad with NaN.
-// - Contiguity: the rewrite multiplies the innermost coordinates by the
-//   innermost stride, a kernel argument. A tensor descriptor always has a
-//   unit innermost stride (TMA requires it, and the frontend checks it), so
-//   that product is replaced by the coordinates, which lets the pointer
-//   analysis see contiguous rows.
-// - Alignment: the base, extents and strides of a host descriptor are kernel
-//   arguments without specialization attributes. The PPU backend puts their
-//   alignment into the cache key (ppu.tensordesc_divisibility on the
-//   descriptor argument: bit 0 for a 16-byte aligned base, bit 1 + d for an
-//   extent of dimension d that is a multiple of 16), and the host checks that
-//   the outer strides are multiples of 16 bytes. The first pass records the
-//   argument's bits on the descriptor load; the second turns them into
-//   tt.divisibility hints on the splats of the base, the extents and the
-//   outer strides in the rewritten pointer and mask.
+// The second pass prepares the expanded loads for vectorized cp.async:
+// - Replace padding with zero and assert that the descriptor does not request
+//   NaN padding, which cp.async cannot provide.
+// - Fold the unit innermost stride guaranteed by tensor descriptors.
+// - Restore alignment hints from ppu.tensordesc_divisibility in the cache key:
+//   bit 0 records a 16-byte aligned base; bit 1 + d records an extent divisible
+//   by 16. Host validation guarantees 16-byte aligned outer strides. The first
+//   pass copies these bits from the descriptor argument to its load, and the
+//   second applies them to the expanded pointer and mask operands.
 
 #include "TritonPPUGPUTransforms/Passes.h"
 

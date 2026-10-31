@@ -21,56 +21,27 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-// Lowering of TLE pipes (tle.pipe.*) to PPU hardware named barriers.
+// Lower TLE pipes to PPU named barriers, with shared-memory counters when the
+// hardware barrier budget is exhausted. For capacity C, full[g][s] publishes a
+// stage to reader group g; empty[s] permits the writer to refill that stage.
+// A full barrier counts only the writer and one reader group, since readers
+// may wait in different orders. An empty barrier counts all endpoints; readers
+// arrive once at initialization to make the first acquire pass.
 //
-// PPU has no mbarrier: a barrier generation completes when a fixed number of
-// threads have arrived (bar.arrive) or synchronized (bar.sync) on it, and the
-// completion of an asynchronous copy is only observable by the thread that
-// issued it (cp.async.wait_group). A pipe of capacity C is therefore mapped to
+// Named barriers publish completed shared-memory stores, not pending cp.async
+// copies. Cross-group commits normally drain their copy group before
+// publishing. A single mixed pipe can defer this until its local reader
+// consumes the slot, keeping younger groups in flight. Reusing a pending slot,
+// blocking on another endpoint, or leaving the writer region drains pending
+// publications. Pipes used within one group use local barriers and wait for
+// copies at reader_wait.
 //
-//   full[g][s] (s < C): the writer arrives after it published stage s, reader
-//                       group g synchronizes before reading it;
-//   empty[s]   (s < C): the readers arrive after they released stage s, the
-//                       writer synchronizes before it refills it.
-//
-// A full barrier counts the writer and one reader group: readers reach their
-// waits in unrelated order, so a barrier shared by two of them could deadlock.
-// An empty barrier counts the writer and all readers, which only arrive on it.
-// The readers arrive on every empty[s] once at start, so the first acquire of
-// each stage passes. Barrier ids must be constants, so a barrier access with a
-// runtime stage is an scf.index_switch with one case per stage. A commit of a
-// stage written by cp.async first commits a copy group and waits for it: the
-// hardware barrier only publishes the warp's completed shared-memory stores.
-// For a single mixed pipe with a reader in the writer's group, structured
-// lowering instead queues the commits in scalar registers. Its local wait
-// completes and publishes the oldest slot while younger groups stay in flight.
-// Reusing a pending slot, blocking on another group, and leaving the writer
-// region drain pending publications. Other pipes keep the immediate wait.
-//
-// A pipe has one writer and at most one reader per warp group, and each
-// endpoint steps through the stages in order; an endpoint that runs the
-// sequence more often than its peer waits on a barrier nobody arrives at.
-//
-// When the writer and the readers are the same threads (a pipe used for
-// software pipelining within one warp group) there is nobody to hand over to:
-// acquire and wait become partition-wide barriers, and the wait also drains
-// the copy groups the same threads committed.
-//
-// Close: a pipe with writer_close keeps one i32 tag per stage in shared
-// memory, as the NVIDIA lowering does; close acquires the stage, stores the
-// tag and publishes the stage, and reader_wait reads it after the barrier.
-//
-// Hardware barriers are scarce (16 per CTA, two reserved by the warp
-// specialization lowering plus one per partition, and the TLE named barriers
-// of the kernel). Pipes get them while they fit, the ones in the deepest loops
-// first and in creation order among equals; the others use software barriers
-// in shared memory: one i32 counter per stage for the writer (full) and one
-// per stage and reader group (empty). After a group-wide barrier the group
-// increments its counter with a scalar atomic add, which the lowering executes
-// on one thread. A waiting group spins until the counter's parity matches the
-// phase of the stage (a writer cannot run more than one generation ahead of
-// its readers, so parity is enough, as with an mbarrier). The spin loop holds
-// no group barrier: each warp leaves it after its own number of iterations.
+// Each endpoint must visit stages in order and match its peers' lifecycle
+// counts. Close tags use one shared i32 per stage. Software barriers use parity
+// counters: one full counter per stage and one empty counter per stage and
+// reader group. Each group updates its counter once after a local barrier. Spin
+// loops contain no group barrier, since warps may leave them on different
+// iterations.
 
 #include "TritonPPUGPUTransforms/Passes.h"
 
